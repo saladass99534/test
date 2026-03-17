@@ -18,6 +18,16 @@ import os
 import joblib
 import matplotlib.pyplot as plt
 import seaborn as sns
+import sys
+
+# --- NumPy Compatibility Shim ---
+# Handles 'ModuleNotFoundError: No module named numpy._core' 
+# occurring when loading NumPy 2.0+ pickles in a NumPy 1.x environment.
+try:
+    import numpy._core
+except ImportError:
+    sys.modules['numpy._core'] = np
+# --------------------------------
 
 from sklearn.metrics import roc_auc_score, confusion_matrix
 
