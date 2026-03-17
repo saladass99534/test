@@ -76,7 +76,7 @@ def main():
     # STEP 3: PREPARE MODEL DATA
     # ===================================
     print("\n[3/6] Preparing model matrices...")
-    X_train, y_train, X_test, y_test, test_df, feat_names = prepare_model_data(
+    X_train, y_train, X_test, y_test, test_df, feat_names, train_emp_ids = prepare_model_data(
         df, prediction_year=args.year
     )
 
@@ -94,7 +94,8 @@ def main():
         X_train, y_train, X_test, y_test, test_df,
         feat_names, full_df=df,
         tune=(not args.no_tune),
-        threshold=args.threshold
+        threshold=args.threshold,
+        train_employee_ids=train_emp_ids
     )
 
     # ===================================

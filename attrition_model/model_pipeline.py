@@ -20,7 +20,7 @@ import warnings
 import joblib
 import json
 
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.model_selection import StratifiedKFold, GroupKFold, cross_val_predict
 from sklearn.metrics import (
     roc_auc_score, recall_score, precision_score, f1_score,
     confusion_matrix, classification_report
@@ -66,18 +66,32 @@ warnings.filterwarnings('ignore')
 # 1. CROSS-VALIDATION EVALUATION
 # =============================================================
 
-def evaluate_cv(model, X, y, n_splits=CV_FOLDS):
-    """Run stratified K-fold CV and return metrics."""
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+def evaluate_cv(model, X, y, groups=None, n_splits=CV_FOLDS):
+    """
+    Run GroupKFold CV (grouped by Employee_ID) to prevent the same
+    employee's monthly rows from leaking across train/validation folds.
+    Falls back to StratifiedKFold if no groups are provided.
+    """
+    if groups is not None:
+        # GroupKFold: all rows for one employee stay in the same fold
+        gkf = GroupKFold(n_splits=n_splits)
+        split_iter = gkf.split(X, y, groups=groups)
+    else:
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        split_iter = skf.split(X, y)
 
     auc_scores = []
     recall_scores = []
     precision_scores = []
     f1_scores = []
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y), 1):
+    for fold, (train_idx, val_idx) in enumerate(split_iter, 1):
         X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
         y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
+
+        # Skip folds with no positive labels in validation
+        if y_val.sum() == 0 or y_tr.sum() == 0:
+            continue
 
         # Apply SMOTE to training fold only
         if HAS_IMBLEARN and y_tr.sum() > 5:
@@ -101,6 +115,10 @@ def evaluate_cv(model, X, y, n_splits=CV_FOLDS):
         precision_scores.append(precision_score(y_val, y_pred, zero_division=0))
         f1_scores.append(f1_score(y_val, y_pred, zero_division=0))
 
+    if not auc_scores:
+        return {'AUC': '0.000', 'Recall': '0.000', 'Precision': '0.000', 'F1': '0.000',
+                'AUC_mean': 0, 'Recall_mean': 0, 'Precision_mean': 0, 'F1_mean': 0}
+
     metrics = {
         'AUC': f"{np.mean(auc_scores):.3f} ± {np.std(auc_scores):.3f}",
         'Recall': f"{np.mean(recall_scores):.3f} ± {np.std(recall_scores):.3f}",
@@ -118,13 +136,18 @@ def evaluate_cv(model, X, y, n_splits=CV_FOLDS):
 # 2. HYPERPARAMETER TUNING (OPTUNA)
 # =============================================================
 
-def tune_xgboost(X_train, y_train, n_trials=OPTUNA_N_TRIALS):
-    """Use Optuna to find optimal XGBoost hyperparameters."""
+def tune_xgboost(X_train, y_train, groups=None, n_trials=OPTUNA_N_TRIALS):
+    """
+    Use Optuna to find optimal XGBoost hyperparameters.
+    Uses GroupKFold (by Employee_ID) to prevent cross-fold leakage.
+    """
     if not HAS_OPTUNA:
         print("   Optuna not available. Using default params.")
         return XGBOOST_DEFAULT_PARAMS
 
     print(f"\n   🔍 Running Optuna hyperparameter search ({n_trials} trials)...")
+    if groups is not None:
+        print(f"   Using GroupKFold with {groups.nunique()} unique employees")
 
     # Calculate class weight
     n_pos = y_train.sum()
@@ -146,12 +169,22 @@ def tune_xgboost(X_train, y_train, n_trials=OPTUNA_N_TRIALS):
             'use_label_encoder': False,
         }
         model = XGBClassifier(**params)
-        skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
-        auc_scores = []
 
-        for train_idx, val_idx in skf.split(X_train, y_train):
+        # Use GroupKFold to prevent employee-level cross-fold leakage
+        if groups is not None:
+            gkf = GroupKFold(n_splits=3)
+            split_iter = gkf.split(X_train, y_train, groups=groups)
+        else:
+            skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+            split_iter = skf.split(X_train, y_train)
+
+        auc_scores = []
+        for train_idx, val_idx in split_iter:
             X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
             y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+
+            if y_val.sum() == 0 or y_tr.sum() == 0:
+                continue
 
             if HAS_IMBLEARN and y_tr.sum() > 5:
                 try:
@@ -168,7 +201,7 @@ def tune_xgboost(X_train, y_train, n_trials=OPTUNA_N_TRIALS):
             except ValueError:
                 auc_scores.append(0)
 
-        return np.mean(auc_scores)
+        return np.mean(auc_scores) if auc_scores else 0
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(direction='maximize')
@@ -190,15 +223,15 @@ def tune_xgboost(X_train, y_train, n_trials=OPTUNA_N_TRIALS):
 # 3. TRAIN FINAL MODEL
 # =============================================================
 
-def train_xgboost(X_train, y_train, params=None, tune=True):
-    """Train the primary XGBoost model."""
+def train_xgboost(X_train, y_train, groups=None, params=None, tune=True):
+    """Train the primary XGBoost model with GroupKFold."""
     print("\n" + "="*60)
     print("   TRAINING XGBOOST MODEL")
     print("="*60)
 
     # Tune if requested
     if tune and HAS_OPTUNA:
-        params = tune_xgboost(X_train, y_train)
+        params = tune_xgboost(X_train, y_train, groups=groups)
     elif params is None:
         params = XGBOOST_DEFAULT_PARAMS.copy()
         n_pos = y_train.sum()
@@ -221,10 +254,10 @@ def train_xgboost(X_train, y_train, params=None, tune=True):
     model = XGBClassifier(**params)
     model.fit(X_train_res, y_train_res, verbose=False)
 
-    # Cross-validation metrics
-    print("\n   Cross-Validation Results:")
+    # Cross-validation metrics (with GroupKFold)
+    print("\n   Cross-Validation Results (GroupKFold — no employee leakage):")
     cv_metrics = evaluate_cv(
-        XGBClassifier(**params), X_train, y_train
+        XGBClassifier(**params), X_train, y_train, groups=groups
     )
     for metric, val in cv_metrics.items():
         if not metric.endswith('_mean'):
@@ -249,14 +282,14 @@ def train_xgboost(X_train, y_train, params=None, tune=True):
 # 4. BASELINE MODEL (Logistic Regression)
 # =============================================================
 
-def train_baseline(X_train, y_train):
+def train_baseline(X_train, y_train, groups=None):
     """Train a Logistic Regression baseline for comparison."""
     print("\n   Training Logistic Regression baseline...")
 
     lr = LogisticRegression(
         max_iter=1000, class_weight='balanced', random_state=42
     )
-    lr_metrics = evaluate_cv(lr, X_train, y_train)
+    lr_metrics = evaluate_cv(lr, X_train, y_train, groups=groups)
     print(f"   Baseline AUC: {lr_metrics['AUC']}")
 
     lr.fit(X_train, y_train)
@@ -527,10 +560,11 @@ def evaluate_test(y_test, y_pred, y_prob):
 # =============================================================
 
 def run_pipeline(X_train, y_train, X_test, y_test, test_df,
-                 feature_names, full_df=None, tune=True, threshold=0.5):
+                 feature_names, full_df=None, tune=True, threshold=0.5,
+                 train_employee_ids=None):
     """
     End-to-end model pipeline:
-      1. Train XGBoost (with optional tuning)
+      1. Train XGBoost (with optional tuning) — GroupKFold by Employee_ID
       2. Train Logistic Regression baseline
       3. Evaluate on test set
       4. Compute SHAP values
@@ -538,13 +572,21 @@ def run_pipeline(X_train, y_train, X_test, y_test, test_df,
       6. Run fairness audit
       7. Save all outputs
 
+    Args:
+        train_employee_ids: Series of Employee_IDs aligned with X_train
+            for GroupKFold cross-validation (prevents employee leakage).
+
     Returns dict with model, predictions, SHAP, survival, fairness results.
     """
     results = {}
 
-    # --- 1. Train Models ---
-    xgb_model, xgb_cv_metrics = train_xgboost(X_train, y_train, tune=tune)
-    lr_model, lr_cv_metrics = train_baseline(X_train, y_train)
+    # --- 1. Train Models (with GroupKFold by Employee_ID) ---
+    xgb_model, xgb_cv_metrics = train_xgboost(
+        X_train, y_train, groups=train_employee_ids, tune=tune
+    )
+    lr_model, lr_cv_metrics = train_baseline(
+        X_train, y_train, groups=train_employee_ids
+    )
 
     results['xgb_model'] = xgb_model
     results['lr_model'] = lr_model
@@ -648,10 +690,11 @@ if __name__ == '__main__':
 
     df = load_master()
     df = build_features(df)
-    X_train, y_train, X_test, y_test, test_df, feat_names = prepare_model_data(df)
+    X_train, y_train, X_test, y_test, test_df, feat_names, train_emp_ids = prepare_model_data(df)
 
     results = run_pipeline(
         X_train, y_train, X_test, y_test, test_df,
-        feat_names, full_df=df, tune=True
+        feat_names, full_df=df, tune=True,
+        train_employee_ids=train_emp_ids
     )
     print("\n🎉 Model pipeline complete!")

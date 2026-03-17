@@ -487,14 +487,27 @@ def scale_features(X_train, X_test=None):
 def prepare_model_data(df, prediction_year=None):
     """
     Prepare X_train, y_train, X_test, y_test from the featured DataFrame.
-    If prediction_year is None, uses the latest year as the test set.
+    If prediction_year is None, auto-selects the latest year with positive targets.
 
-    Returns (X_train, y_train, X_test, y_test, test_df, feature_names)
+    Returns (X_train, y_train, X_test, y_test, test_df, feature_names, train_employee_ids)
+    Note: train_employee_ids is for GroupKFold cross-validation.
     """
     if prediction_year is None:
-        prediction_year = df['Year'].max()
+        # Auto-select latest year with positive targets
+        # (Current year like 2026 may have 0 positives since the future hasn't happened)
+        years_with_pos = (
+            df.groupby('Year')[TARGET_COLUMN].sum()
+        )
+        years_with_targets = years_with_pos[years_with_pos > 0]
+        if not years_with_targets.empty:
+            prediction_year = int(years_with_targets.index.max())
+            print(f"\n   Auto-selected prediction year: {prediction_year} "
+                  f"(latest with {int(years_with_targets[prediction_year])} positive targets)")
+        else:
+            prediction_year = df['Year'].max()
+            print(f"\n   WARNING: No year has positive targets. Using latest: {prediction_year}")
 
-    print(f"\n   Preparing model data for prediction year: {prediction_year}")
+    print(f"   Preparing model data for prediction year: {prediction_year}")
 
     # One-hot encode categorical features
     all_features = BASE_FEATURES + CATEGORICAL_FEATURES
@@ -509,6 +522,9 @@ def prepare_model_data(df, prediction_year=None):
     train_mask = df['Year'] < prediction_year
     X_train = X_all[train_mask].fillna(0)
     y_train = y_all[train_mask].fillna(0)
+
+    # Extract employee IDs for GroupKFold (aligned with X_train)
+    train_employee_ids = df.loc[train_mask, 'Employee_ID']
 
     # Test set: de-duplicated per employee (latest snapshot in prediction year)
     test_raw = df[df['Year'] == prediction_year].sort_values(
@@ -531,8 +547,9 @@ def prepare_model_data(df, prediction_year=None):
 
     print(f"   Train: {len(X_train):,} rows ({y_train.sum():,} positive)")
     print(f"   Test:  {len(X_test):,} rows ({y_test.sum():,} positive)")
+    print(f"   Unique employees in train: {train_employee_ids.nunique():,}")
 
-    return X_train, y_train, X_test, y_test, test_unique, feature_names
+    return X_train, y_train, X_test, y_test, test_unique, feature_names, train_employee_ids
 
 
 # =============================================================
