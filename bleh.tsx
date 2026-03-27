@@ -221,11 +221,15 @@ print("--- 4. Processing EOS ---")
 INTENT_STAY_MAP = {
     'Strongly Disagree':             1,
     'Disagree':                      2,
-    'Neither Agree nor Disagree':    3,
-    'Neutral':                       3,   # older file variant
+    'Neither Agree Nor Disagree':    3,   # title-cased
+    'Neutral':                       3,
     'Agree':                         4,
     'Strongly Agree':                5,
 }
+
+# Inside the file-reading loop, change the mapping line to:
+tmp['Intent_Stay'] = tmp['Intent_Stay'].astype(str).str.strip()
+tmp['Intent_Stay_Score'] = tmp['Intent_Stay'].str.title().map(INTENT_STAY_MAP)
 
 eos_rows = []
 
@@ -372,16 +376,31 @@ if eos_rows:
     # Intentionally do NOT back-fill delta — no prior cycle exists for Jan/Feb 2022.
 
     # ------------------------------------------------------------------
-    # STEP D5: Compute Months_Since_Survey (unchanged from original)
+# ------------------------------------------------------------------
+    # STEP D5: Compute Months_Since_Survey
+    #
+    # merge_asof requirements:
+    #   1. Both frames must be sorted by the `on` column only
+    #   2. The `by` column (Employee_ID) handles grouping but must not
+    #      break monotonicity — sort by Employee_ID THEN Month_Date
+    #   3. Month_Date must be datetime dtype (not Period or object)
     # ------------------------------------------------------------------
     all_survey_dates = (
         df_eos[['Employee_ID', 'EOS_Date']]
         .drop_duplicates()
         .sort_values(['Employee_ID', 'EOS_Date'])
+        .reset_index(drop=True)
     )
 
-    df_hc = df_hc.sort_values(['Employee_ID', 'Month_Date'])
-    all_survey_dates = all_survey_dates.sort_values(['Employee_ID', 'EOS_Date'])
+    # Ensure Month_Date is proper datetime — merge_asof fails on Period dtype
+    df_hc['Month_Date'] = pd.to_datetime(df_hc['Month_Date'])
+    all_survey_dates['EOS_Date'] = pd.to_datetime(all_survey_dates['EOS_Date'])
+
+    # Both frames must be sorted by Employee_ID then the on-column
+    df_hc = df_hc.sort_values(['Employee_ID', 'Month_Date']).reset_index(drop=True)
+    all_survey_dates = all_survey_dates.sort_values(
+        ['Employee_ID', 'EOS_Date']
+    ).reset_index(drop=True)
 
     df_hc = pd.merge_asof(
         df_hc,
@@ -393,7 +412,7 @@ if eos_rows:
     )
 
     df_hc['Months_Since_Survey'] = (
-        (df_hc['Month_Date'].dt.year  - df_hc['Last_Survey_Date'].dt.year) * 12 +
+        (df_hc['Month_Date'].dt.year  - df_hc['Last_Survey_Date'].dt.year)  * 12 +
         (df_hc['Month_Date'].dt.month - df_hc['Last_Survey_Date'].dt.month)
     ).clip(lower=0)
 
