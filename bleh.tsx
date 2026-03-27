@@ -207,21 +207,25 @@ if not df_promo.empty:
 # =========================
 # D. EOS — FULL FEATURE SET
 #
-# Produces four columns:
-#   Intent_Stay_EOS      — LOCF score (including Jan/Feb 2022 fix)
-#   EOS_Delta            — change vs prior survey cycle (negative = declining)
+# Produces five columns:
+#   Intent_Stay_EOS      — LOCF text label  (e.g. "Strongly Agree")
+#   Intent_Stay_Score    — LOCF numeric score (1–5)
+#   EOS_Delta            — change in numeric score vs prior survey cycle
 #   Months_Since_Survey  — staleness of the score (0 in survey month, up to 5)
-#   EOS_Nonresponse      — 1 if employee was active in a survey month but did not respond
-#
-# Jan/Feb 2022 fix:
-#   Core data starts Jan 2022 so there is no Sept 2021 row to carry forward from.
-#   Fix: for each employee, find their EARLIEST available EOS score and back-fill
-#   it to any earlier months that would otherwise be null. This ensures Jan and Feb
-#   2022 receive the March 2022 score (or earliest available) rather than staying null.
-#   This is conservative — it does not invent a 2021 score, it just ensures the
-#   first known score is present from the start of the employee's window.
+#   EOS_Nonresponse      — 1 if active in survey month but did not respond
 # =========================
 print("--- 4. Processing EOS ---")
+
+# Mapping covers all known text variants across file vintages.
+# "Neutral" is used in some older files instead of "Neither Agree nor Disagree".
+INTENT_STAY_MAP = {
+    'Strongly Disagree':             1,
+    'Disagree':                      2,
+    'Neither Agree nor Disagree':    3,
+    'Neutral':                       3,   # older file variant
+    'Agree':                         4,
+    'Strongly Agree':                5,
+}
 
 eos_rows = []
 
@@ -264,6 +268,21 @@ for root, _, files in os.walk(PATH_EOS):
             continue
 
         tmp = df[['Employee_ID', 'Intent_Stay']].copy()
+
+        # Normalise text: strip whitespace, title-case for safety
+        tmp['Intent_Stay'] = tmp['Intent_Stay'].astype(str).str.strip()
+
+        # Map to numeric — unmapped values become NaN (will surface in null check)
+        tmp['Intent_Stay_Score'] = tmp['Intent_Stay'].map(INTENT_STAY_MAP)
+
+        unmapped = tmp['Intent_Stay_Score'].isna() & (tmp['Intent_Stay'] != 'nan')
+        if unmapped.any():
+            print(f"   WARNING: unmapped Intent_Stay values in {f}:")
+            print(f"   {tmp.loc[unmapped, 'Intent_Stay'].unique().tolist()}")
+
+        # Replace raw 'nan' strings (from employees with no answer) with actual NaN
+        tmp.loc[tmp['Intent_Stay'] == 'nan', 'Intent_Stay'] = None
+
         tmp['EOS_Date'] = eos_date
         eos_rows.append(tmp)
 
@@ -273,11 +292,15 @@ if eos_rows:
 
     # ------------------------------------------------------------------
     # STEP D1: Merge raw EOS scores onto headcount on exact survey months
-    # This gives us a score only in March and September rows initially.
+    # Brings in both text label and numeric score for survey months only.
     # ------------------------------------------------------------------
     df_hc = pd.merge(
         df_hc,
-        df_eos.rename(columns={'Intent_Stay': 'Intent_Stay_Raw', 'EOS_Date': 'EOS_Date'}),
+        df_eos.rename(columns={
+            'Intent_Stay':       'Intent_Stay_Raw',
+            'Intent_Stay_Score': 'Intent_Stay_Score_Raw',
+            'EOS_Date':          'EOS_Date'
+        }),
         left_on=['Employee_ID', 'Month_Date'],
         right_on=['Employee_ID', 'EOS_Date'],
         how='left'
@@ -285,56 +308,53 @@ if eos_rows:
     df_hc.drop(columns=['EOS_Date'], inplace=True, errors='ignore')
 
     # ------------------------------------------------------------------
-    # STEP D2: Forward-fill to get LOCF score across all months
-    # After ffill, each row carries the most recent survey score forward.
-    # This is the primary score column used as a model feature.
+    # STEP D2: Forward-fill text label and numeric score (LOCF)
+    # Use .ffill() directly on the grouped series — avoids FutureWarning.
     # ------------------------------------------------------------------
     df_hc = df_hc.sort_values(['Employee_ID', 'Month_Date'])
+
     df_hc['Intent_Stay_EOS'] = (
-        df_hc.groupby('Employee_ID')['Intent_Stay_Raw'].transform(lambda x: x.ffill())
+        df_hc.groupby('Employee_ID')['Intent_Stay_Raw']
+        .ffill()
+    )
+    df_hc['Intent_Stay_Score'] = (
+        df_hc.groupby('Employee_ID')['Intent_Stay_Score_Raw']
+        .ffill()
     )
 
     # ------------------------------------------------------------------
-    # STEP D3: Jan/Feb 2022 fix — backward-fill the EARLIEST known score
-    #
-    # Problem: Jan and Feb 2022 sit before the first survey cycle in the
-    # data window (March 2022). ffill() finds no prior value so they stay null.
-    #
-    # Fix: for each employee, take their first ever non-null EOS score and
-    # back-fill it to any rows that are still null BEFORE that score arrived.
-    # This is equivalent to saying "we don't know their score was different
-    # before March 2022, so we use March 2022 as the best available proxy."
-    #
-    # bfill() only affects rows that are still null after ffill() — i.e.
-    # only rows that precede the employee's very first survey response.
+    # STEP D3: Jan/Feb 2022 fix — back-fill earliest known score
+    # Rows before the first ever survey response stay null after ffill.
+    # bfill() fills them with the first known value going forward.
+    # Only affects rows that precede the employee's very first response.
     # ------------------------------------------------------------------
     df_hc['Intent_Stay_EOS'] = (
-        df_hc.groupby('Employee_ID')['Intent_Stay_EOS'].transform(lambda x: x.bfill())
+        df_hc.groupby('Employee_ID')['Intent_Stay_EOS']
+        .bfill()
+    )
+    df_hc['Intent_Stay_Score'] = (
+        df_hc.groupby('Employee_ID')['Intent_Stay_Score']
+        .bfill()
     )
 
     # ------------------------------------------------------------------
-    # STEP D4: Compute EOS_Delta — change vs the previous survey cycle
-    #
-    # Logic:
-    #   1. Keep only survey-month rows with actual responses.
-    #   2. Within each employee, shift the score by 1 to get the prior value.
-    #   3. Compute delta = current - prior.
-    #   4. Merge delta back onto all headcount rows.
-    #   5. Forward-fill delta the same way as the score itself.
-    #
-    # A negative delta means engagement dropped since last survey — one of
-    # the strongest leading indicators of voluntary attrition.
+    # STEP D4: Compute EOS_Delta on NUMERIC score only
+    # Text subtraction was the cause of the original TypeError.
+    # Delta = current numeric score minus prior cycle numeric score.
     # ------------------------------------------------------------------
     df_eos_scored = df_eos.copy()
     df_eos_scored = df_eos_scored.sort_values(['Employee_ID', 'EOS_Date'])
-    df_eos_scored['Intent_Stay_Prev'] = (
-        df_eos_scored.groupby('Employee_ID')['Intent_Stay'].shift(1)
+
+    # Shift within each employee to get prior cycle's numeric score
+    df_eos_scored['Intent_Stay_Score_Prev'] = (
+        df_eos_scored.groupby('Employee_ID')['Intent_Stay_Score'].shift(1)
     )
+
+    # Delta is numeric - numeric: no TypeError possible
     df_eos_scored['EOS_Delta'] = (
-        df_eos_scored['Intent_Stay'] - df_eos_scored['Intent_Stay_Prev']
+        df_eos_scored['Intent_Stay_Score'] - df_eos_scored['Intent_Stay_Score_Prev']
     )
-    # Delta is null for an employee's very first survey — that is correct.
-    # There is no prior cycle to compare against.
+    # Delta is NaN for first-ever survey per employee — correct, leave as null.
 
     df_hc = pd.merge(
         df_hc,
@@ -348,37 +368,18 @@ if eos_rows:
     df_hc.drop(columns=['EOS_Date_Delta'], inplace=True, errors='ignore')
 
     # Forward-fill delta the same way as the score
-    df_hc['EOS_Delta'] = (
-        df_hc.groupby('Employee_ID')['EOS_Delta'].transform(lambda x: x.ffill())
-    )
-    # Note: intentionally do NOT back-fill delta for Jan/Feb 2022.
-    # The delta for the first cycle is genuinely unknown — leave as null.
-    # The model will treat null delta as missing, which is correct.
+    df_hc['EOS_Delta'] = df_hc.groupby('Employee_ID')['EOS_Delta'].ffill()
+    # Intentionally do NOT back-fill delta — no prior cycle exists for Jan/Feb 2022.
 
     # ------------------------------------------------------------------
-    # STEP D5: Compute Months_Since_Survey
-    #
-    # For each row, find the most recent survey date that is <= this row's
-    # Month_Date, then compute the difference in months.
-    #
-    # This tells the model how stale the score is:
-    #   0 = survey month itself (freshest)
-    #   1 = one month after survey
-    #   ...up to 5 = month just before the next survey
-    #
-    # After the Jan/Feb 2022 back-fill, those rows get Months_Since_Survey
-    # computed from the March 2022 survey date — which means Jan 2022 = -2
-    # and Feb 2022 = -1. We floor these at 0 to avoid negative staleness.
+    # STEP D5: Compute Months_Since_Survey (unchanged from original)
     # ------------------------------------------------------------------
-
-    # Build a lookup: for each employee, the sorted list of their survey dates
     all_survey_dates = (
         df_eos[['Employee_ID', 'EOS_Date']]
         .drop_duplicates()
         .sort_values(['Employee_ID', 'EOS_Date'])
     )
 
-    # Merge as-of: for each headcount row, find the latest survey date <= Month_Date
     df_hc = df_hc.sort_values(['Employee_ID', 'Month_Date'])
     all_survey_dates = all_survey_dates.sort_values(['Employee_ID', 'EOS_Date'])
 
@@ -388,81 +389,61 @@ if eos_rows:
         left_on='Month_Date',
         right_on='Last_Survey_Date',
         by='Employee_ID',
-        direction='backward'   # find latest survey date <= snapshot month
+        direction='backward'
     )
 
-    # Compute month difference and floor at 0 (handles Jan/Feb 2022 edge case)
     df_hc['Months_Since_Survey'] = (
         (df_hc['Month_Date'].dt.year  - df_hc['Last_Survey_Date'].dt.year) * 12 +
         (df_hc['Month_Date'].dt.month - df_hc['Last_Survey_Date'].dt.month)
     ).clip(lower=0)
 
-    # Employees with no survey at all get null — correct, do not impute
     df_hc.loc[df_hc['Last_Survey_Date'].isna(), 'Months_Since_Survey'] = None
     df_hc.drop(columns=['Last_Survey_Date'], inplace=True, errors='ignore')
 
     # ------------------------------------------------------------------
-    # STEP D6: Compute EOS_Nonresponse flag
-    #
-    # Definition: employee was active in a survey cycle month (March or
-    # September) but has no raw Intent_Stay score for that specific cycle.
-    #
-    # This is a weak behavioral signal — employees who skip a survey they
-    # previously completed may be showing early disengagement.
-    #
-    # Value encoding:
-    #   1   = active in survey month, expected to respond, did NOT respond
-    #   0   = responded (or first ever survey so no prior to compare)
-    #   NaN = month is not a survey cycle month (not applicable)
-    #
-    # Important: we only flag non-response for employees who have responded
-    # to AT LEAST ONE prior survey. A new joiner missing their first survey
-    # is not non-response — it may simply be they were excluded by policy.
+    # STEP D6: Compute EOS_Nonresponse flag (unchanged from original)
     # ------------------------------------------------------------------
-
-    # Identify employees who have responded to at least one survey ever
     ever_responded = (
         df_eos.groupby('Employee_ID')['Intent_Stay']
         .count()
         .reset_index()
         .rename(columns={'Intent_Stay': 'N_Surveys_Taken'})
     )
-    ever_responded = ever_responded[ever_responded['N_Surveys_Taken'] >= 1]['Employee_ID'].tolist()
+    ever_responded = ever_responded[
+        ever_responded['N_Surveys_Taken'] >= 1
+    ]['Employee_ID'].tolist()
 
-    # Flag rows that fall on a survey cycle month
     df_hc['_Is_Survey_Month'] = df_hc['Month_Date'].dt.month.isin(EOS_CYCLE_MONTHS)
+    df_hc['_Has_Raw_Score']   = df_hc['Intent_Stay_Raw'].notna()
+    df_hc['_Ever_Responded']  = df_hc['Employee_ID'].isin(ever_responded)
 
-    # Flag rows that have a raw score (responded to this specific cycle)
-    df_hc['_Has_Raw_Score'] = df_hc['Intent_Stay_Raw'].notna()
-
-    # Flag employees who have ever responded
-    df_hc['_Ever_Responded'] = df_hc['Employee_ID'].isin(ever_responded)
-
-    # Non-response = survey month + ever responded before + no score this cycle
-    df_hc['EOS_Nonresponse'] = None  # default: not applicable (non-survey months)
+    df_hc['EOS_Nonresponse'] = None
     survey_month_mask = df_hc['_Is_Survey_Month']
-    df_hc.loc[survey_month_mask, 'EOS_Nonresponse'] = 0  # default to responded
+    df_hc.loc[survey_month_mask, 'EOS_Nonresponse'] = 0
     df_hc.loc[
         survey_month_mask & df_hc['_Ever_Responded'] & ~df_hc['_Has_Raw_Score'],
         'EOS_Nonresponse'
     ] = 1
 
-    # Convert to nullable integer so NaN stays NaN (not -9999 or similar)
     df_hc['EOS_Nonresponse'] = df_hc['EOS_Nonresponse'].astype('Int8')
 
-    # Clean up internal helper columns
+    # Clean up internal helper columns and raw staging columns
     df_hc.drop(
-        columns=['Intent_Stay_Raw', '_Is_Survey_Month', '_Has_Raw_Score', '_Ever_Responded'],
+        columns=[
+            'Intent_Stay_Raw', 'Intent_Stay_Score_Raw',
+            '_Is_Survey_Month', '_Has_Raw_Score', '_Ever_Responded'
+        ],
         inplace=True,
         errors='ignore'
     )
 
 else:
     print("WARNING: No EOS data loaded. All EOS columns will be null.")
-    df_hc['Intent_Stay_EOS']  = None
-    df_hc['EOS_Delta']        = None
+    df_hc['Intent_Stay_EOS']     = None
+    df_hc['Intent_Stay_Score']   = None
+    df_hc['EOS_Delta']           = None
     df_hc['Months_Since_Survey'] = None
-    df_hc['EOS_Nonresponse']  = None
+    df_hc['EOS_Nonresponse']     = None
 
 # =========================
 # E. SAVE
